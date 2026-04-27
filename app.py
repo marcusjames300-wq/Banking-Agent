@@ -1,0 +1,268 @@
+import streamlit as st
+import yfinance as yf
+from google import genai
+import requests
+import base64
+from datetime import datetime, time
+import plotly.graph_objects as go
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import json
+import os
+import pytz
+
+st.set_page_config(
+    page_title="Banking Trading Agent",
+    page_icon="🏦",
+    layout="wide"
+)
+
+st.markdown('<meta http-equiv="refresh" content="1800">', unsafe_allow_html=True)
+
+uk_tz = pytz.timezone('Europe/London')
+uk_now = datetime.now(uk_tz)
+
+st.title("🏦 Banking Trading Agent")
+st.caption(f"Last updated: {uk_now.strftime('%d/%m/%Y %H:%M:%S')} (UK time)")
+st.caption("⏱️ Auto refreshes every 30 minutes — Monitoring Lloyds Banking Group")
+st.progress(1.0)
+
+market_open = time(8, 0)
+market_close = time(16, 30)
+current_time = uk_now.time()
+is_weekday = uk_now.weekday() < 5
+
+if is_weekday and market_open <= current_time <= market_close:
+    st.success("🟢 Market is OPEN — Live data active")
+else:
+    st.warning("🔴 Market is CLOSED — Showing last closing prices")
+
+T212_API_KEY = st.secrets["T212_API_KEY"]
+T212_API_SECRET = st.secrets["T212_API_SECRET"]
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+GMAIL_ADDRESS = st.secrets["GMAIL_ADDRESS"]
+GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
+ALERT_EMAIL = st.secrets["ALERT_EMAIL"]
+
+def send_alert_email(alert_level, alert_msg, stock_name, current_price, todays_change, ai_analysis, gmail_address, gmail_password, alert_emails):
+    try:
+        recipients = [email.strip() for email in alert_emails.split(',')]
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"🚨 {stock_name} Alert: {alert_level}"
+        msg['From'] = gmail_address
+        msg['To'] = ', '.join(recipients)
+        body = f"""
+Banking Trading Agent Alert — {stock_name}
+
+Alert Level: {alert_level}
+Message: {alert_msg}
+
+Current Price: £{current_price:.2f}
+Todays Change: {todays_change:.2f}%
+
+AI Analysis:
+{ai_analysis}
+
+This is not financial advice.
+        """
+        msg.attach(MIMEText(body, 'plain'))
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        server.login(gmail_address, gmail_password)
+        server.sendmail(gmail_address, recipients, msg.as_string())
+        server.quit()
+        return True
+    except Exception:
+        return False
+
+def analyse_stock(ticker, name):
+    try:
+        stock = yf.Ticker(ticker)
+        history = stock.history(period="3mo")
+        info = stock.info
+
+        if history.empty:
+            st.error(f"No data available for {name}")
+            return
+
+        history['MA20'] = history['Close'].rolling(window=20).mean()
+        history['MA50'] = history['Close'].rolling(window=50).mean()
+
+        current_price = history['Close'].iloc[-1]
+        ma20 = history['MA20'].iloc[-1]
+        ma50 = history['MA50'].iloc[-1]
+        avg_volume = history['Volume'].mean()
+        current_volume = history['Volume'].iloc[-1]
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+        week52_high = history['High'].max()
+        week52_low = history['Low'].min()
+        distance_from_52high = ((current_price - week52_high) / week52_high) * 100
+        distance_from_52low = ((current_price - week52_low) / week52_low) * 100
+        open_price = info.get('open', current_price)
+        todays_change = ((current_price - open_price) / open_price) * 100
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Current Price", f"£{current_price:.2f}", f"{todays_change:.2f}%")
+        with col2:
+            st.metric("20 Day Average", f"£{ma20:.2f}")
+        with col3:
+            st.metric("52 Week High", f"£{week52_high:.2f}")
+        with col4:
+            st.metric("52 Week Low", f"£{week52_low:.2f}")
+
+        st.subheader("📋 Key Stats")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            dividend_yield = info.get('dividendYield', 0)
+            st.metric("Dividend Yield", f"{dividend_yield:.2f}%" if dividend_yield else "N/A")
+        with col2:
+            pe_ratio = info.get('trailingPE', 0)
+            st.metric("P/E Ratio", f"{pe_ratio:.2f}" if pe_ratio else "N/A")
+        with col3:
+            target_price = info.get('targetMeanPrice', 0)
+            st.metric("Analyst Target", f"{target_price:.2f}p" if target_price else "N/A")
+
+        st.subheader("📈 90 Day Price Chart")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=history.index, y=history['Close'],
+            name=name, line=dict(color='#00BFFF', width=2)
+        ))
+        fig.add_trace(go.Scatter(
+            x=history.index, y=history['MA20'],
+            name='20 Day Average', line=dict(color='orange', width=1, dash='dash')
+        ))
+        fig.add_trace(go.Scatter(
+            x=history.index, y=history['MA50'],
+            name='50 Day Average', line=dict(color='red', width=1, dash='dash')
+        ))
+        fig.update_layout(
+            height=400,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("🔔 Price Alert")
+        send_email = False
+        alert_level = ""
+        alert_msg = ""
+
+        if todays_change >= 10 or todays_change <= -10:
+            alert_level = "🔴 RED ALERT"
+            alert_msg = f"Extreme move of {todays_change:.2f}%"
+            st.error(f"{alert_level}: {alert_msg}")
+            send_email = True
+        elif todays_change >= 5 or todays_change <= -5:
+            alert_level = "🟠 ORANGE ALERT"
+            alert_msg = f"Strong move of {todays_change:.2f}%"
+            st.warning(f"{alert_level}: {alert_msg}")
+            send_email = True
+        elif todays_change >= 3 or todays_change <= -3:
+            alert_level = "🟡 YELLOW ALERT"
+            alert_msg = f"Moderate move of {todays_change:.2f}%"
+            st.warning(f"{alert_level}: {alert_msg}")
+            send_email = True
+        else:
+            alert_level = "🟢 GREEN"
+            alert_msg = f"Normal range — {'UP' if todays_change > 0 else 'DOWN'} {abs(todays_change):.2f}% today"
+            st.success(f"{alert_level}: {alert_msg}")
+
+        st.subheader("📰 Latest News")
+        news = stock.news
+        headlines = []
+        for article in news[:5]:
+            content = article.get('content', {})
+            title = content.get('title', '')
+            canonical = content.get('canonicalUrl', {})
+            link = canonical.get('url', '')
+            if title:
+                headlines.append(title)
+                st.markdown(f"📌 [{title}]({link})")
+        headlines_text = " | ".join(headlines)
+
+        st.subheader("🎯 News Sentiment")
+        positive_words = ['growth', 'profit', 'up', 'rise', 'gain', 'positive', 'strong',
+                          'beat', 'exceed', 'record', 'high', 'deal', 'partner', 'win',
+                          'expand', 'boost', 'surge', 'rally', 'outperform', 'upgrade']
+        negative_words = ['fall', 'drop', 'loss', 'down', 'decline', 'negative', 'weak',
+                          'miss', 'below', 'low', 'cut', 'reduce', 'risk', 'warn',
+                          'debt', 'concern', 'struggle', 'slump', 'crash', 'downgrade']
+        positive_count = 0
+        negative_count = 0
+        for headline in headlines:
+            headline_lower = headline.lower()
+            for word in positive_words:
+                if word in headline_lower:
+                    positive_count += 1
+            for word in negative_words:
+                if word in headline_lower:
+                    negative_count += 1
+        total = positive_count + negative_count
+        if total == 0:
+            sentiment_score = 50
+        elif positive_count > negative_count:
+            sentiment_score = min(50 + ((positive_count / total) * 50), 100)
+        else:
+            sentiment_score = max(50 - ((negative_count / total) * 50), 0)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Positive Signals", f"✅ {positive_count}")
+        with col2:
+            st.metric("Negative Signals", f"❌ {negative_count}")
+        with col3:
+            if sentiment_score >= 65:
+                st.metric("Overall Sentiment", "🟢 Positive")
+            elif sentiment_score <= 35:
+                st.metric("Overall Sentiment", "🔴 Negative")
+            else:
+                st.metric("Overall Sentiment", "🟡 Neutral")
+        st.progress(sentiment_score / 100)
+        st.caption(f"Sentiment score: {sentiment_score:.0f}/100")
+
+        st.subheader("🧠 AI Trading Recommendation")
+        with st.spinner(f"Analysing {name}..."):
+            prompt = (
+                "You are an experienced trading analyst specialising in UK banking stocks. "
+                f"You are supporting a retail investor monitoring {name} (LON: LLOY) on the London Stock Exchange. "
+                "The investor prefers buying dips and selling when in profit, "
+                "wants clear simple buy/sell/wait guidance in plain English. "
+                "Key factors for Lloyds: UK economic health, interest rates, mortgage market, "
+                "consumer confidence, and regulatory environment. "
+                f"Current Price: {current_price:.2f}p. "
+                f"Todays Change: {todays_change:.2f}%. "
+                f"20 Day Average: {ma20:.2f}p. "
+                f"50 Day Average: {ma50:.2f}p. "
+                f"Volume vs Normal: {volume_ratio:.2f}x. "
+                f"From 52 week High: {distance_from_52high:.2f}%. "
+                f"From 52 week Low: {distance_from_52low:.2f}%. "
+                f"Latest News: {headlines_text}. "
+                "Key rules: BUY when price is below 20 day average, volume normal or low, no bad news. "
+                "SELL when price extended above averages near 52 week highs. "
+                "WAIT when signals are mixed. "
+                "Provide: 1. RECOMMENDATION: Buy/Sell/Wait. "
+                "2. REASON: One clear sentence. "
+                "3. KEY LEVEL TO WATCH: One specific price. "
+                "4. RISK WARNING: One thing that could go wrong. "
+                "Under 150 words, plain English, no jargon."
+            )
+            try:
+                ai_response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt
+                )
+                ai_text = ai_response.text
+                st.info(ai_text)
+
+                if send_email:
+                    email_sent = send_alert_email(
+                        alert_level, alert_msg, name, current_price, todays_change,
+                        ai_text, GMAIL_ADDRESS, GMAIL_APP_PASSWORD, ALERT_EMAIL
+                    )
+                    if email_sent:
+                        st.success("📧 Alert email sent!")
+                    else:
