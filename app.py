@@ -51,6 +51,11 @@ encoded = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
 t212_headers = {"Authorization": f"Basic {encoded}"}
 BASE_URL = "https://live.trading212.com/api/v0"
 
+def safe_change(current, open_price):
+    if open_price and open_price > 0:
+        return ((current - open_price) / open_price) * 100
+    return 0.0
+
 def send_alert_email(alert_level, alert_msg, stock_name, current_price, todays_change, ai_analysis, gmail_address, gmail_password, alert_emails):
     try:
         recipients = [email.strip() for email in alert_emails.split(',')]
@@ -119,10 +124,7 @@ week52_low = history['Low'].min()
 distance_from_52high = ((current_price - week52_high) / week52_high) * 100
 distance_from_52low = ((current_price - week52_low) / week52_low) * 100
 open_price = info.get('open', 0)
-if open_price and open_price > 0:
-    todays_change = ((current_price - open_price) / open_price) * 100
-else:
-    todays_change = 0.0
+todays_change = safe_change(current_price, open_price)
 
 change_icon = "📈" if todays_change > 0 else "📉"
 position = ((current_price - week52_low) / (week52_high - week52_low)) * 100
